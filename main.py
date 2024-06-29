@@ -15,7 +15,7 @@ import redis
 r = redis.Redis(host='localhost', port=6379, db=0)
 app = FastAPI()
 origins = [
-    "https://chabot-sigma.vercel.app"
+    "https://chabot-sigma.vercel.app",
     "http://localhost",
     "http://localhost:3000",
 ]
