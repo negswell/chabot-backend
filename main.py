@@ -74,39 +74,50 @@ async def chat(request: ChatRequest,db: AsyncSession = Depends(get_db)):
             context["budget"]=maxi
 
     context["skills"]=list(context["skills"])
-    #context cache
+    #check if context is in cache
     cache_response = r.get(f"context:{context}") 
     if cache_response :
         return json.loads(cache_response)
 
-    #scalar search
+    #scalar search and get all the skills of every user satisfying the scalar filters and rank user according to count of most number of matched skills in the context
     context_skill_ids = [skill_names.get(skill,"") for skill in context["skills"]]
-    context_user_ids_result = await db.execute(select(MercorUsers.userId.distinct())
-                           .join(MercorUserSkills,MercorUserSkills.userId==MercorUsers.userId)
-                           .filter(and_(MercorUserSkills.skillId.in_(context_skill_ids),and_(MercorUsers.partTime==1,MercorUsers.partTimeSalary<=int(context["budget"])) if "part" in context["employment_type"] else MercorUsers.partTime==0,and_(MercorUsers.fullTime==1,MercorUsers.fullTimeSalary<=int(context["budget"])) if "full" in context["employment_type"] else MercorUsers.fullTime==0)))
- 
-
-    #get all the skills of every user satisfying the scalar filters and rank user according to count of most number of matched skills in the context
-    context_user_ids = [user[0] for user in context_user_ids_result]
-    skill_ids= {skill["skillId"]:skill["skillName"] for skill in skills}
-    res = await db.execute(select(MercorUserSkills.userId,MercorUsers.name,MercorUsers.email,MercorUsers.phone,MercorUsers.workAvailability,
-                                  MercorUsers.fullTime,MercorUsers.fullTimeSalary,MercorUsers.fullTimeAvailability,MercorUsers.partTime,MercorUsers.partTimeSalary,
-                                  MercorUsers.partTimeAvailability, func.group_concat(MercorUserSkills.skillId.op('separator')(';')),
-                                   func.sum(case({skill_id: 1 for skill_id in context_skill_ids},value=MercorUserSkills.skillId,else_=0)).label("count"))
-                                   .join(MercorUsers,MercorUsers.userId==MercorUserSkills.userId).filter((MercorUserSkills.userId.in_(context_user_ids)))
-                                   .group_by(MercorUserSkills.userId,MercorUsers.name,MercorUsers.email,MercorUsers.phone,MercorUsers.workAvailability,
-                                  MercorUsers.fullTime,MercorUsers.fullTimeSalary,MercorUsers.fullTimeAvailability,MercorUsers.partTime,MercorUsers.partTimeSalary,
-                                  MercorUsers.partTimeAvailability).order_by(column("count").desc()).limit(3))
-    
+    res = list(await db.execute(select(MercorUsers.userId,MercorUsers.name,MercorUsers.email,MercorUsers.phone,MercorUsers.workAvailability,
+                                MercorUsers.fullTime,MercorUsers.fullTimeSalary,MercorUsers.fullTimeAvailability,MercorUsers.partTime,MercorUsers.partTimeSalary,
+                                MercorUsers.partTimeAvailability, 
+                                func.sum(case({skill_id: 1 for skill_id in context_skill_ids},value=MercorUserSkills.skillId,else_=0)).label("count"))
+                        .join(MercorUserSkills,MercorUserSkills.userId==MercorUsers.userId)
+                        .filter(and_(MercorUserSkills.skillId.in_(context_skill_ids),and_(MercorUsers.partTime==1,
+                        MercorUsers.partTimeSalary<=int(context["budget"])) if "part" in context["employment_type"] else MercorUsers.partTime==0,
+                        and_(MercorUsers.fullTime==1,MercorUsers.fullTimeSalary<=int(context["budget"])) if "full" in context["employment_type"] else MercorUsers.fullTime==0))
+                        .group_by(MercorUserSkills.userId,MercorUsers.name,MercorUsers.email,MercorUsers.phone,MercorUsers.workAvailability,
+                                MercorUsers.fullTime,MercorUsers.fullTimeSalary,MercorUsers.fullTimeAvailability,MercorUsers.partTime,MercorUsers.partTimeSalary,
+                                MercorUsers.partTimeAvailability).order_by(column("count").desc()).limit(3)))
     users=defaultdict(dict)
-    for user_id,name,email,phone,workAvailability,fullTime,fullTimeSalary,fullTimeAvailability,partTime,partTimeSalary,partTimeAvailability,user_skill_ids,count in res :
-        users[user_id]={
-            "user_id":user_id,
+    context_user_ids =[user_id for user_id,*_ in res]
+    filtered_context_user_ids=[]
+    #check if user skills are in cache 
+    for user_id in context_user_ids :
+        cached_user_skills = r.get(f"skills:{user_id}")
+        if cached_user_skills :
+            users[user_id]["skills"]=json.loads(cached_user_skills)
+        else :
+            filtered_context_user_ids.append(user_id)
+            
+    skill_ids= {skill["skillId"]:skill["skillName"] for skill in skills}
+
+    #get all the skill ids of the users not in the cache and in the context 
+    context_user_skills = await db.execute(select(MercorUserSkills.userId,func.group_concat(MercorUserSkills.skillId.op('separator')(';'))).filter(MercorUserSkills.userId.in_(filtered_context_user_ids)).group_by(MercorUserSkills.userId))
+   
+    for user_id,user_skill_ids in context_user_skills :
+        user_skills = [skill_ids[skill_id] for skill_id in user_skill_ids.split(";")]
+        r.set(f"skills:{user_id}",json.dumps(user_skills))
+        users[user_id]["skills"]=user_skills
+
+    for user_id,name,email,phone,workAvailability,fullTime,fullTimeSalary,fullTimeAvailability,partTime,partTimeSalary,partTimeAvailability,count in res :
+        users[user_id].update({
             "name":name,
             "phone":phone,
             "email":email,
-            "skills":[],
-            "skills_in_context":0,
             "workAvailability":workAvailability,
             "fullTime":fullTime,
             "fullTimeSalary":fullTimeSalary,
@@ -114,12 +125,11 @@ async def chat(request: ChatRequest,db: AsyncSession = Depends(get_db)):
             "partTimeSalary":partTimeSalary,
             "fullTimeAvailability":fullTimeAvailability,
             "partTimeAvailability":partTimeAvailability,
-            "skills":[skill_ids[skill_id] for skill_id in user_skill_ids.split(";")],
             "skills_in_context":int(count),
             "workExperience":[],
             "education":[],
             "location":""
-        }
+        })
 
     res = await db.execute((select(UserResume.userId,PersonalInformation.location,
         func.group_concat(
@@ -165,7 +175,8 @@ async def chat(request: ChatRequest,db: AsyncSession = Depends(get_db)):
 
     bot_msg=f'I was able to find candidates who meet your requirements. Would you like to refine the search with additional criteria {"" if len(parsed_employment_types) != 0 else ", such as availability (part-time or full-time)"} {"" if len(parsed_budget) != 0 else ", the compensation being offered per month in USD"} ?'
     response = {"bot_msg":bot_msg,"context":context,"candidates":list(users.values())}
-    r.set(f"context:{context}",json.dumps(response),ex=60*60*60)
+    if len(users) !=0 :
+        r.set(f"context:{context}",json.dumps(response),ex=60*60*60)
     return response
 
 app.include_router(router)
